@@ -3,6 +3,38 @@
   Last updated: 2026-07-08
 ================================================================================
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SESSION HANDOFF (2026-07-08) — RESUME HERE TOMORROW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Done today: SystemOwner role (config-driven, X-Dev-Owner-Email dev check),
+ClinicsController locked down to it, POST /api/clinics now bootstraps the
+clinic's first Owner Staff row, POST /api/clinics/{id}/staff added for
+cross-tenant staff creation. Full details in the two dated entries under
+KNOWN ISSUES & FIXES below ("SystemOwner role + clinic-creation bootstrap"
+and "POST /api/clinics/{id}/staff"). Companion frontend work (the /owner
+area) is in clinicflow-web's own PROGRESS.txt, Steps 27–28.
+
+Repo state: this was the first commit for this project — git init'd and
+pushed today. Remote: git@github.com:ayarida/ClinicFlowBack.git (branch
+master). Frontend remote: git@github.com:ayarida/ClinicFlowFront.git.
+
+Dev servers: were left running at the end of today's session
+(dotnet run --project ClinicFlow.csproj --urls "http://localhost:5062" and,
+in clinicflow-web, npm run dev on :3000) — check `tasklist` before starting
+new ones to avoid a port clash / build file-lock.
+
+Next up (pick one):
+  1. Azure AD real configuration — see "AZURE AD SETUP & ROLE-BASED AUTH —
+     NEXT SESSION STARTING POINT" below. Readiness checklist is still all
+     unchecked; this hasn't been started.
+  2. StaffRole (Owner/Receptionist) [Authorize(Roles=...)] rollout — see
+     CHANGE 1–4 in that same section. Explicitly deferred today in favor of
+     the SystemOwner work; still fully outstanding.
+  3. Minor cleanup: several test clinics accumulated in the dev DB during
+     today's manual/curl verification (Sunrise Dental, Proxy Test Clinic,
+     Ayas Clinics, etc.) — harmless, but worth pruning before a demo.
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ARCHITECTURE OVERVIEW
