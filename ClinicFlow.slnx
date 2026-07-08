@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="ClinicFlow.Application/ClinicFlow.Application.csproj" />
+  <Project Path="ClinicFlow.csproj" />
+  <Project Path="ClinicFlow.Domain/ClinicFlow.Domain.csproj" />
+  <Project Path="ClinicFlow.Infrastructure/ClinicFlow.Infrastructure.csproj" />
+</Solution>

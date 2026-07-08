@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>aspnet-ClinicFlow-93eaff0d-409c-4a64-b097-b5e14e6146fe</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.9" NoWarn="NU1605" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="10.0.9" NoWarn="NU1605" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.9">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.Identity.Web" Version="3.14.1" />
+    <PackageReference Include="Microsoft.Identity.Web.DownstreamApi" Version="3.14.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="ClinicFlow.Application\ClinicFlow.Application.csproj" />
+    <ProjectReference Include="ClinicFlow.Infrastructure\ClinicFlow.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="ClinicFlow.Domain\**" />
+    <Compile Remove="ClinicFlow.Application\**" />
+    <Compile Remove="ClinicFlow.Infrastructure\**" />
+  </ItemGroup>
+
+</Project>

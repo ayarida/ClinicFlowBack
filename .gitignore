@@ -1,0 +1,19 @@
+# Build results
+bin/
+obj/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+
+# User-specific launch settings
+*.slnLaunch.user
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code local session/tooling state
+.claude/

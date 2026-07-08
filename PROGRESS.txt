@@ -1,0 +1,1080 @@
+================================================================================
+  CLINICFLOW — IMPLEMENTATION PROGRESS & API REFERENCE
+  Last updated: 2026-07-08
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ARCHITECTURE OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Clean Architecture, 4 layers:
+  - ClinicFlow.Domain         — Entities, enums, repository interfaces
+  - ClinicFlow.Application    — CQRS via MediatR, FluentValidation, DTOs
+  - ClinicFlow.Infrastructure — EF Core DbContext, repositories, migrations
+  - ClinicFlow (API)          — Controllers, middleware, Program.cs
+
+Pattern: every feature lives at ClinicFlow.Application/Features/<Domain>/
+  Commands/Create<X>/   — Command + Handler + Validator
+  Commands/Update<X>/   — Command + Handler + Validator
+  Queries/Get<X>s/      — Query + Handler (+ optional Validator)
+  DTOs/                 — <X>Dto, <X>SummaryDto
+
+Multi-tenancy: every entity has ClinicId (Guid). All queries filter by it.
+  TenantMiddleware resolves ClinicId from JWT → Staff table → HttpContext.Items["ClinicId"]
+  Dev bypass: DevClinicId in appsettings.Development.json (hardcoded GUID, no JWT needed)
+
+Error handling: ExceptionHandlingMiddleware translates exceptions → HTTP codes:
+  ValidationException         → 400
+  NotFoundException           → 404
+  ConflictException           → 409
+  UnauthorizedAccessException → 401
+  anything else               → 500
+
+Database: SQL Server LocalDB
+  Connection: Server=(localdb)\mssqllocaldb;Database=ClinicFlowDb
+
+EF migration commands (must use full csproj paths):
+  dotnet ef migrations add <Name> --project ClinicFlow.Infrastructure/ClinicFlow.Infrastructure.csproj --startup-project ClinicFlow.csproj
+  dotnet ef database update       --project ClinicFlow.Infrastructure/ClinicFlow.Infrastructure.csproj --startup-project ClinicFlow.csproj
+
+Dev run command:
+  dotnet run --project ClinicFlow.csproj --urls "http://localhost:5062"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  DOMAIN ENTITIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All entities follow the same pattern:
+  - Factory method Create(...) — no public constructor
+  - Mutation methods Update(...), Deactivate() — no public setters
+  - BaseEntity provides: Id (Guid), CreatedAt (DateTime), UpdatedAt (DateTime)
+
+1. CLINIC
+   File: ClinicFlow.Domain/Entities/Clinic.cs
+   Properties: Name, Phone, Address, LogoUrl?, WorkingHoursStart (TimeOnly),
+               WorkingHoursEnd (TimeOnly), SlotDurationMinutes, IsActive
+   Methods: Create(...), Update(...), Deactivate(), Activate()
+   Note: No ClinicId — Clinic IS the top-level tenant root.
+
+2. STAFF
+   File: ClinicFlow.Domain/Entities/Staff.cs
+   Properties: ClinicId, Name, Email, Role (StaffRole enum), IsActive
+   Methods: Create(clinicId, name, email, role), Update(name, role), Deactivate()
+   Enums: StaffRole { Owner=0, Receptionist=1 }
+
+3. CUSTOMER
+   File: ClinicFlow.Domain/Entities/Customer.cs
+   Properties: ClinicId, Name, Phone, Email?, DateOfBirth?, Gender?, Notes?
+   Methods: Create(clinicId, name, phone, email?, dob?, gender?, notes?), Update(...)
+   Enums: Gender { Male=0, Female=1, Other=2 }
+
+4. TREATMENT
+   File: ClinicFlow.Domain/Entities/Treatment.cs
+   Properties: ClinicId, Name, Description?, DurationMinutes, FollowUpIntervalDays (int?),
+               Price (decimal?), IsActive
+   Methods: Create(...), Update(...), Deactivate()
+   Note: FollowUpIntervalDays drives the follow-up suggestion calculation.
+
+5. APPOINTMENT
+   File: ClinicFlow.Domain/Entities/Appointment.cs
+   Properties: ClinicId, CustomerId, Date (DateOnly), TimeSlot (TimeOnly),
+               Status (AppointmentStatus), Notes?
+   Navigation: Customer, Treatments (List<AppointmentTreatment>)
+   Methods: Create(...), Update(date, timeSlot, notes), Cancel(), Complete(), MarkNoShow()
+   Enums: AppointmentStatus { Scheduled=0, Completed=1, Cancelled=2, NoShow=3 }
+
+6. APPOINTMENTTREATMENT  (join entity)
+   File: ClinicFlow.Domain/Entities/AppointmentTreatment.cs
+   Properties: AppointmentId, TreatmentId, Notes?
+   Navigation: Treatment
+   Methods: Create(appointmentId, treatmentId, notes?)
+   Role: bridges Appointment ↔ Treatment (one appointment → many treatments)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  DATABASE SCHEMA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Clinics
+  Id (PK), Name, Phone, Address, LogoUrl?, WorkingHoursStart, WorkingHoursEnd,
+  SlotDurationMinutes, IsActive, CreatedAt, UpdatedAt
+
+Staff                                    → FK → Clinics(Id)
+  Id (PK), ClinicId (FK), Name, Email, Role, IsActive, CreatedAt, UpdatedAt
+  Index: (ClinicId, Email)
+
+Customers                                → FK → Clinics(Id)
+  Id (PK), ClinicId (FK), Name, Phone, Email?, DateOfBirth?, Gender?,
+  Notes?, CreatedAt, UpdatedAt
+  Index: (ClinicId, Phone)
+
+Treatments                               → FK → Clinics(Id)
+  Id (PK), ClinicId (FK), Name, Description?, DurationMinutes,
+  FollowUpIntervalDays?, Price?, IsActive, CreatedAt, UpdatedAt
+  Index: (ClinicId, Name)
+
+Appointments                             → FK → Clinics(Id), Customers(Id)
+  Id (PK), ClinicId (FK), CustomerId (FK), Date, TimeSlot, Status,
+  Notes?, CreatedAt, UpdatedAt
+  Index: (ClinicId, Date), (ClinicId, CustomerId)
+
+AppointmentTreatments                    → FK → Appointments(Id), Treatments(Id)
+  Id (PK), AppointmentId (FK), TreatmentId (FK), Notes?, CreatedAt, UpdatedAt
+
+Migrations applied:
+  1. InitialCreate        — Customers table
+  2. AddTreatments        — Treatments table
+  3. AddClinicAndStaff    — Clinics, Staff tables
+  4. AddAppointments      — Appointments, AppointmentTreatments tables
+  5. AddClinicForeignKeys — FK constraints from all entities → Clinics (all Restrict)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  COMPLETE API REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All endpoints are tenant-scoped — the ClinicId is resolved from the JWT token
+(or DevClinicId fallback in Development). Callers never pass ClinicId explicitly.
+
+Enums are serialized as strings (e.g. "Scheduled", not 0).
+
+────────────────────────────────────────────────────────────────────────────────
+  CLINICS   /api/clinics
+────────────────────────────────────────────────────────────────────────────────
+
+NOTE: Unlike every other controller, Clinics endpoints are NOT tenant-scoped —
+Clinic IS the tenant root, so GET/PUT/PATCH-by-id operate across ALL clinics
+(admin-style). Only GET /me, POST, and PUT /me are scoped to the caller's own
+clinic via ICurrentClinicService. This supports a "Clinics" admin list page
+in the frontend (see clinicflow-web/PROGRESS.txt).
+
+GET /api/clinics
+  Description : Returns ALL clinics (not tenant-scoped — admin/list view).
+  Auth        : Owner only (once role auth is wired).
+  Response 200: [ <ClinicDto>, ... ]  (same shape as GET /me response below,
+                each including "isActive")
+
+GET /api/clinics/me
+  Description : Returns the current clinic's full profile.
+  Auth        : Any authenticated staff member.
+  Response 200:
+    {
+      "id": "guid",
+      "name": "string",
+      "phone": "string",
+      "address": "string",
+      "logoUrl": "string | null",
+      "workingHoursStart": "08:00:00",
+      "workingHoursEnd": "18:00:00",
+      "slotDurationMinutes": 30,
+      "isActive": true,
+      "createdAt": "datetime"
+    }
+  Errors: 404 if no clinic exists yet for this tenant.
+
+POST /api/clinics
+  Description : Creates a new clinic (first-time setup).
+  Auth        : Owner only (once role auth is wired).
+  Body:
+    {
+      "name": "string (required)",
+      "phone": "string (required)",
+      "address": "string (required)",
+      "logoUrl": "string | null",
+      "workingHoursStart": "08:00:00",
+      "workingHoursEnd": "18:00:00",
+      "slotDurationMinutes": 30
+    }
+  Response 201: { "id": "guid" }
+  Errors: 400 on validation failure, 409 if name already exists.
+
+PUT /api/clinics/me
+  Description : Updates the current clinic's profile.
+  Auth        : Owner only.
+  Body        : Same shape as POST body above.
+  Response 204.
+  Errors: 400 on validation, 404 if clinic not found.
+
+PUT /api/clinics/{id}
+  Description : Updates ANY clinic's profile by id (admin edit, not tenant-scoped).
+                Command: UpdateClinicByIdCommand. Route id overwrites any Id in
+                the request body via `command with { Id = id }` (matches the
+                Staff/Treatments update-by-id convention).
+  Auth        : Owner only (once role auth is wired).
+  Body        : Same shape as POST body above.
+  Response 204.
+  Errors: 400 on validation, 404 if not found, 409 on name conflict with another clinic.
+
+PATCH /api/clinics/{id}/deactivate
+  Description : Sets IsActive = false on the given clinic.
+  Auth        : Owner only.
+  Body        : None.
+  Response 204.
+  Errors: 404 if not found.
+
+PATCH /api/clinics/{id}/activate
+  Description : Sets IsActive = true on the given clinic (reactivation).
+  Auth        : Owner only.
+  Body        : None.
+  Response 204.
+  Errors: 404 if not found.
+
+────────────────────────────────────────────────────────────────────────────────
+  STAFF   /api/staff
+────────────────────────────────────────────────────────────────────────────────
+
+GET /api/staff
+  Description : Returns all staff members for the current clinic.
+  Auth        : Owner only.
+  Response 200:
+    [
+      {
+        "id": "guid",
+        "clinicId": "guid",
+        "name": "string",
+        "email": "string",
+        "role": "Owner | Receptionist",
+        "isActive": true
+      }
+    ]
+
+GET /api/staff/{id}
+  Description : Returns a single staff member by ID.
+  Auth        : Owner only.
+  Response 200: Same shape as list item above.
+  Errors: 404 if not found or belongs to a different clinic.
+
+POST /api/staff
+  Description : Creates a new staff member and assigns them to the current clinic.
+  Auth        : Owner only.
+  Body:
+    {
+      "name": "string (required)",
+      "email": "string (required, unique within clinic)",
+      "role": "Owner | Receptionist"
+    }
+  Response 201: { "id": "guid" }
+  Errors: 400 on validation, 409 if email already registered in this clinic.
+
+PUT /api/staff/{id}
+  Description : Updates a staff member's name and/or role.
+  Auth        : Owner only.
+  Body:
+    {
+      "name": "string (required)",
+      "role": "Owner | Receptionist"
+    }
+  Response 204.
+  Errors: 400, 404.
+
+PATCH /api/staff/{id}/deactivate
+  Description : Soft-deletes a staff member (sets IsActive = false).
+                Deactivated staff can no longer log in.
+  Auth        : Owner only.
+  Body        : None.
+  Response 204.
+  Errors: 404, 409 if already inactive.
+
+────────────────────────────────────────────────────────────────────────────────
+  CUSTOMERS   /api/customers
+────────────────────────────────────────────────────────────────────────────────
+
+GET /api/customers?search=
+  Description : Returns all customers for the clinic. Optional ?search= filters
+                by name OR phone (case-insensitive contains match).
+  Auth        : Owner, Receptionist.
+  Query params:
+    search (optional) — partial name or phone number
+  Response 200:
+    [
+      {
+        "id": "guid",
+        "name": "string",
+        "phone": "string",
+        "email": "string | null"
+      }
+    ]
+  Note: Returns CustomerSummaryDto — Id/Name/Phone/Email only, NO gender (despite
+  this doc previously showing one). No notes/dob/gender — use GET /{id} for full detail.
+
+GET /api/customers/{id}
+  Description : Returns the full customer profile including notes and date of birth.
+  Auth        : Owner, Receptionist.
+  Response 200:
+    {
+      "id": "guid",
+      "clinicId": "guid",
+      "name": "string",
+      "phone": "string",
+      "email": "string | null",
+      "dateOfBirth": "date | null",
+      "gender": "Male | Female | Other | null",
+      "notes": "string | null",
+      "createdAt": "datetime",
+      "updatedAt": "datetime"
+    }
+  Errors: 404.
+
+POST /api/customers
+  Description : Creates a new customer profile under the current clinic.
+  Auth        : Owner, Receptionist.
+  Body:
+    {
+      "name": "string (required)",
+      "phone": "string (required, unique within clinic)",
+      "email": "string | null",
+      "dateOfBirth": "date | null",
+      "gender": "Male | Female | Other | null",
+      "notes": "string | null"
+    }
+  Response 201: { "id": "guid" }
+  Errors: 400 on validation, 409 if phone already exists in this clinic.
+  Note: Location header correctly points to GET /api/customers/{id} for the new
+  customer (unlike the old POST /api/clinics bug — see FIXED 2026-07-07 below —
+  CustomersController's CreatedAtAction already referenced GetCustomerById with
+  the real route id, so this one was never broken).
+
+PUT /api/customers/{id}
+  Description : Updates all editable fields on a customer profile.
+  Auth        : Owner, Receptionist.
+  Body        : Same shape as POST body above.
+  Response 204.
+  Errors: 400, 404, 409 on phone conflict with another customer.
+
+────────────────────────────────────────────────────────────────────────────────
+  TREATMENTS   /api/treatments
+────────────────────────────────────────────────────────────────────────────────
+
+GET /api/treatments
+  Description : Returns all active treatments in the clinic's service catalog.
+  Auth        : Owner, Receptionist.
+  Response 200:
+    [
+      {
+        "id": "guid",
+        "clinicId": "guid",
+        "name": "string",
+        "description": "string | null",
+        "durationMinutes": 60,
+        "followUpIntervalDays": 30,   ← null means no follow-up
+        "price": 250.00,              ← null means price not set
+        "isActive": true
+      }
+    ]
+
+GET /api/treatments/{id}
+  Description : Returns a single treatment by ID.
+  Auth        : Owner, Receptionist.
+  Response 200: Same shape as list item above.
+  Errors: 404.
+
+POST /api/treatments
+  Description : Adds a new treatment to the clinic's service catalog.
+  Auth        : Owner only.
+  Body:
+    {
+      "name": "string (required, unique within clinic)",
+      "description": "string | null",
+      "durationMinutes": 60,
+      "followUpIntervalDays": 30,     ← null = no follow-up
+      "price": 250.00                 ← null = unpriced
+    }
+  Response 201: { "id": "guid" }
+  Errors: 400 on validation, 409 if name already exists in this clinic.
+
+PUT /api/treatments/{id}
+  Description : Updates a treatment's details (name, duration, price, follow-up interval).
+  Auth        : Owner only.
+  Body        : Same shape as POST body above.
+  Response 204.
+  Errors: 400, 404, 409.
+
+PATCH /api/treatments/{id}/deactivate
+  Description : Soft-deletes a treatment (sets IsActive = false).
+                Deactivated treatments no longer appear in the catalog
+                but existing appointment history is preserved.
+  Auth        : Owner only.
+  Body        : None.
+  Response 204.
+  Errors: 404, 409 if already inactive.
+
+────────────────────────────────────────────────────────────────────────────────
+  APPOINTMENTS   /api/appointments
+────────────────────────────────────────────────────────────────────────────────
+
+GET /api/appointments?date=&customerId=
+  Description : Returns appointments for the clinic. Both filters are optional
+                and combinable. Without filters, returns all appointments.
+  Auth        : Owner, Receptionist.
+  Query params:
+    date       (optional) — ISO date, e.g. 2026-07-15
+    customerId (optional) — Guid
+  Response 200:
+    [
+      {
+        "id": "guid",
+        "customerId": "guid",
+        "customerName": "string",
+        "date": "2026-07-15",
+        "timeSlot": "10:00:00",
+        "status": "Scheduled | Completed | Cancelled | NoShow",
+        "treatmentNames": ["Laser Treatment", "Facial"]
+      }
+    ]
+  Note: Returns AppointmentSummaryDto — use GET /{id} for full detail with notes.
+
+GET /api/appointments/{id}
+  Description : Returns the full appointment detail including notes and per-treatment notes.
+  Auth        : Owner, Receptionist.
+  Response 200:
+    {
+      "id": "guid",
+      "customerId": "guid",
+      "customerName": "string",
+      "date": "2026-07-15",
+      "timeSlot": "10:00:00",
+      "status": "Scheduled",
+      "notes": "string | null",
+      "treatments": [
+        {
+          "treatmentId": "guid",
+          "treatmentName": "string",
+          "notes": "string | null"
+        }
+      ],
+      "createdAt": "datetime"
+    }
+  Errors: 404.
+
+GET /api/appointments/calendar?year=&month=
+  Description : Returns a monthly calendar view. Only days that have at least one
+                appointment are included. Each day lists its appointments ordered
+                by time slot.
+  Auth        : Owner, Receptionist.
+  Query params:
+    year  (required) — integer, 2000–2100
+    month (required) — integer, 1–12
+  Response 200:
+    [
+      {
+        "date": "2026-07-15",
+        "appointments": [
+          {
+            "id": "guid",
+            "customerId": "guid",
+            "customerName": "string",
+            "date": "2026-07-15",
+            "timeSlot": "09:00:00",
+            "status": "Scheduled",
+            "treatmentNames": ["Laser Treatment"]
+          }
+        ]
+      }
+    ]
+  Errors: 400 if year/month are out of range or missing.
+
+POST /api/appointments
+  Description : Creates a new appointment and links one or more treatments to it.
+                Validates that the time slot is not already taken (skips cancelled).
+  Auth        : Owner, Receptionist.
+  Body:
+    {
+      "customerId": "guid (required)",
+      "date": "2026-07-15",
+      "timeSlot": "10:00:00",
+      "notes": "string | null",
+      "treatments": [
+        {
+          "treatmentId": "guid",
+          "notes": "string | null"
+        }
+      ]
+    }
+  Response 201: { "id": "guid" }
+  Errors: 400 on validation, 404 if customer/treatment not found,
+          409 if time slot is already booked.
+
+PUT /api/appointments/{id}
+  Description : Updates date, time slot, notes, and treatment list for an appointment.
+                Replaces the treatment list entirely — send the full desired list.
+                Only Scheduled appointments can be updated.
+  Auth        : Owner, Receptionist.
+  Body        : Same shape as POST body above.
+  Response 204.
+  Errors: 400, 404, 409 (slot conflict or wrong status).
+  Note: Uses explicit RemoveRange + AddRange on AppointmentTreatments to avoid
+        EF concurrency errors on collection updates.
+
+PATCH /api/appointments/{id}/cancel
+  Description : Cancels a Scheduled appointment. Cancelled slots become
+                available for new bookings.
+  Auth        : Owner, Receptionist.
+  Body        : None.
+  Response 204.
+  Errors: 404, 409 if appointment is not in Scheduled status.
+
+PATCH /api/appointments/{id}/complete
+  Description : Marks a Scheduled appointment as Completed.
+                After this, use GET /{id}/follow-up-suggestions to see
+                which treatments recommend a follow-up visit.
+  Auth        : Owner, Receptionist.
+  Body        : None.
+  Response 204.
+  Errors: 404, 409 if appointment is not in Scheduled status.
+
+PATCH /api/appointments/{id}/no-show
+  Description : Marks a Scheduled appointment as NoShow (customer did not attend).
+  Auth        : Owner, Receptionist.
+  Body        : None.
+  Response 204.
+  Errors: 404, 409 if appointment is not in Scheduled status.
+
+GET /api/appointments/{id}/follow-up-suggestions
+  Description : For a Completed appointment, returns one suggestion per treatment
+                that has a FollowUpIntervalDays value set. The suggested date is
+                appointment.Date + treatment.FollowUpIntervalDays.
+                Use the result to pre-fill a new POST /api/appointments call.
+  Auth        : Owner, Receptionist.
+  Response 200:
+    [
+      {
+        "treatmentId": "guid",
+        "treatmentName": "Laser Treatment",
+        "followUpIntervalDays": 30,
+        "suggestedDate": "2026-08-14"
+      }
+    ]
+  Note: Returns an empty array if no treatments in the appointment have
+        a follow-up interval configured.
+  Errors: 404 if appointment not found,
+          409 if appointment is not in Completed status.
+
+────────────────────────────────────────────────────────────────────────────────
+  REPORTS   /api/reports
+────────────────────────────────────────────────────────────────────────────────
+
+GET /api/reports/daily?date=
+  Description : Returns a full daily overview for the clinic owner.
+                Includes appointment count broken down by status plus the full
+                appointment list for that day ordered by time slot.
+  Auth        : Owner only.
+  Query params:
+    date (required) — ISO date, e.g. 2026-07-15
+  Response 200:
+    {
+      "date": "2026-07-15",
+      "total": 8,
+      "scheduled": 3,
+      "completed": 4,
+      "cancelled": 1,
+      "noShow": 0,
+      "appointments": [
+        {
+          "id": "guid",
+          "customerId": "guid",
+          "customerName": "string",
+          "date": "2026-07-15",
+          "timeSlot": "09:00:00",
+          "status": "Completed",
+          "treatmentNames": ["Facial", "Microneedling"]
+        }
+      ]
+    }
+  Errors: 400 if date is missing.
+
+GET /api/reports/monthly?year=&month=
+  Description : Returns a monthly summary for the clinic owner.
+                Includes aggregate totals for the whole month plus a per-day
+                stat breakdown. Days with zero appointments are excluded.
+  Auth        : Owner only.
+  Query params:
+    year  (required) — integer, 2000–2100
+    month (required) — integer, 1–12
+  Response 200:
+    {
+      "year": 2026,
+      "month": 7,
+      "total": 62,
+      "totalScheduled": 10,
+      "totalCompleted": 45,
+      "totalCancelled": 5,
+      "totalNoShow": 2,
+      "days": [
+        {
+          "date": "2026-07-01",
+          "total": 6,
+          "scheduled": 1,
+          "completed": 4,
+          "cancelled": 1,
+          "noShow": 0
+        }
+      ]
+    }
+  Errors: 400 if year/month are out of range or missing.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  INFRASTRUCTURE LAYER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DbContext: ClinicFlow.Infrastructure/Persistence/ClinicFlowDbContext.cs
+  DbSets: Appointments, AppointmentTreatments, Clinics, Customers, Staff, Treatments
+
+Entity Configurations (Persistence/Configurations/):
+  CustomerConfiguration.cs
+  TreatmentConfiguration.cs
+  ClinicConfiguration.cs
+  StaffConfiguration.cs
+  AppointmentConfiguration.cs
+    - Customer FK: DeleteBehavior.Restrict
+    - Treatment FK on AppointmentTreatment: DeleteBehavior.Restrict
+    - AppointmentTreatments: DeleteBehavior.Cascade
+    - Indexes: (ClinicId, Date), (ClinicId, CustomerId)
+
+Repositories (Persistence/Repositories/):
+  CustomerRepository    implements ICustomerRepository
+  TreatmentRepository   implements ITreatmentRepository
+  ClinicRepository      implements IClinicRepository
+  StaffRepository       implements IStaffRepository
+    - GetByEmailAsync has NO clinicId param (global lookup needed for TenantMiddleware)
+  AppointmentRepository implements IAppointmentRepository
+    - GetByIdAsync       : Include Customer + Treatments + Treatment (eager load)
+    - GetAllAsync        : same includes, optional date/customerId filter
+    - GetByMonthAsync    : filters by year+month range, same eager load, ordered Date/TimeSlot
+    - TimeSlotTakenAsync : excludes Cancelled appointments from conflict check
+    - ReplaceTreatments  : RemoveRange old + explicit AddRange new on DbSet (not via Update())
+
+DependencyInjection.cs: registers all 5 repos + UnitOfWork as Scoped
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  API LAYER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Controllers/:
+  ClinicsController.cs      — GET / (all, admin list), GET /me, POST /, PUT /me,
+                               PUT /{id}, PATCH /{id}/deactivate, PATCH /{id}/activate
+  StaffController.cs        — full CRUD + deactivate
+  CustomersController.cs    — full CRUD + search
+  TreatmentsController.cs   — full CRUD + deactivate
+  AppointmentsController.cs — full CRUD + cancel/complete/no-show + calendar + follow-up suggestions
+  ReportsController.cs      — daily overview, monthly summary
+
+Middleware/:
+  ExceptionHandlingMiddleware.cs — translates all exceptions to structured JSON responses
+  TenantMiddleware.cs — resolves ClinicId from JWT claims → Staff.GetByEmailAsync
+                        falls back to DevClinicId (appsettings.Development.json) if no JWT
+
+Services/:
+  CurrentClinicService.cs — reads ClinicId from HttpContext.Items["ClinicId"]
+                            throws UnauthorizedAccessException (→ 401) if not set
+
+Program.cs middleware order:
+  ExceptionHandlingMiddleware → UseAuthentication → TenantMiddleware → UseAuthorization → MapControllers
+
+Dev bypass (appsettings.Development.json):
+  DevClinicId: "873fb706-2603-4c16-83de-69b6c1999326"
+  This ClinicId matches the Clinics row created during testing. Keep it up to date.
+
+Enum serialization: JSON uses string names (JsonStringEnumConverter in Program.cs)
+  e.g., status returns "Scheduled" not 0
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PHASE 1 FEATURE STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[✅] Customer management         — create, edit, search by name/phone
+[✅] Service catalog             — create, edit, deactivate treatments
+[✅] Appointment management      — create, edit, cancel, complete, no-show
+[✅] Multi-treatment appointments — multiple treatments per appointment
+[✅] Calendar view               — monthly view grouped by day, ordered by time
+[✅] Follow-up suggestions       — suggested next-visit dates after completing an appointment
+[✅] Daily report                — status breakdown + full appointment list for a day
+[✅] Monthly report              — aggregate totals + per-day stat breakdown
+[✅] Clinic profile              — create and update clinic details
+[✅] Clinic admin list           — list all clinics, edit/activate/deactivate by id
+[✅] Staff management            — create, edit, deactivate, role assignment
+
+Remaining (not yet implemented):
+[⬜] Role-based authorization (StaffRole: Owner/Receptionist)
+      - StaffRole enum and Staff entity exist, but [Authorize(Roles = "...")] not applied yet
+      - TenantMiddleware resolves ClinicId but does not inject a StaffRole claim into the principal
+      - Approach: after resolving Staff in TenantMiddleware, add a ClaimsIdentity with the
+        role claim, then use [Authorize(Roles = "Owner")] / [Authorize(Roles = "Owner,Receptionist")]
+        on controller actions — see the per-controller access matrix under
+        "AZURE AD SETUP & ROLE-BASED AUTH" below. NOT started by the SystemOwner work below —
+        that's a separate, cross-tenant concept that doesn't touch StaffRole.
+
+[⬜] Azure AD real configuration
+      - Configure appsettings.json AzureAd section with real TenantId + ClientId
+      - Remove/guard DevClinicId bypass once real auth is wired
+      - Staff emails must match the "preferred_username" claim from Azure AD tokens
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  KNOWN ISSUES & FIXES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[✅ FIXED 2026-06-30] APPOINTMENT UPDATE — DbUpdateConcurrencyException
+    Endpoint: PUT /api/appointments/{id}
+    Root cause: EF graph traversal in context.Appointments.Update() marked new
+    AppointmentTreatment entities as Modified → UPDATE on non-existent rows → exception.
+    Fix: AppointmentRepository.ReplaceTreatments() now calls
+    context.AppointmentTreatments.AddRange(list) explicitly before adding to the
+    navigation collection. Handler does NOT call appointmentRepository.Update(appointment).
+
+[✅ FIXED 2026-06-30] FK CONSTRAINTS — entities → Clinics table
+    Migration: AddClinicForeignKeys
+    Added FK_Appointments_Clinics_ClinicId, FK_Customers_Clinics_ClinicId,
+    FK_Staff_Clinics_ClinicId, FK_Treatments_Clinics_ClinicId — all Restrict.
+    Note: One orphan Customer row (old stub ClinicId 00000000-...0001) was
+    updated to DevClinicId before the migration could apply.
+
+[✅ FIXED 2026-07-07] POST /api/clinics — misleading Location header
+    Root cause: CreatedAtAction(nameof(GetClinic), ...) pointed at GET /me, which
+    ignores any id and always returns the CALLER's own tenant clinic (via
+    ICurrentClinicService) — following the Location header returned the wrong clinic.
+    Fix: added GET /api/clinics/{id} (GetClinicByIdQuery/Handler, cross-tenant lookup
+    by id via IClinicRepository.GetByIdAsync — same admin-style scoping as the
+    existing PUT/{id} and activate/deactivate-by-id endpoints). CreatedAtAction now
+    points at GetClinicById, so the Location header resolves to the newly created
+    clinic. Verified: created a clinic, GET on the returned Location header now
+    returns that exact clinic; GET /me still correctly returns the dev tenant's
+    own clinic, unaffected; 404 on an unknown id.
+    Former caveat resolved 2026-07-08: see the SystemOwner entry below — clinic
+    creation now bootstraps the first Owner Staff row in the same request.
+
+[✅ ADDED 2026-07-08] SystemOwner role + clinic-creation bootstrap
+    New, separate cross-tenant identity — NOT part of StaffRole (Owner/Receptionist
+    stays clinic-scoped; a SystemOwner isn't tied to any Staff row or ClinicId).
+    Identity: config-driven. "SystemOwnerEmails" (appsettings.json, empty by default)
+    is checked against the JWT preferred_username/email claim in TenantMiddleware;
+    a match adds a ClaimTypes.Role "SystemOwner" claim to the principal. In
+    Development (no Azure AD configured yet), the same check runs against a
+    dev-only "X-Dev-Owner-Email" request header instead of a JWT claim — this is
+    what the frontend's /owner entry screen (clinicflow-web) sends. A match
+    replaces HttpContext.User with an authenticated dev identity carrying the role
+    claim (plain AddIdentity isn't enough here since, unlike the JWT path, there's
+    no already-authenticated primary identity for [Authorize]'s anonymous check to
+    see). This replaced an earlier blanket "DevIsSystemOwner: true" flag (2026-07-08,
+    same day) — that granted the role to every unauthenticated dev request
+    regardless of email, which wasn't a real check; the header now goes through the
+    identical SystemOwnerEmails matching logic as the eventual JWT path, so nothing
+    changes here when Azure AD/MSAL lands. Dev config: SystemOwnerEmails is set to
+    ["owner@clinicflow.dev"] in appsettings.Development.json as a placeholder value.
+    Enforcement: builder.Services.AddAuthorization() added in Program.cs (was never
+    called). ClinicsController is now [Authorize(Roles = "SystemOwner")] at the
+    class level; GET/PUT /api/clinics/me are [AllowAnonymous] (clinic-scoped, not
+    cross-tenant — left open pending the StaffRole rollout above).
+    Bootstrap: CreateClinicCommand gained OwnerName/OwnerEmail. The handler now
+    creates the Clinic and its first Staff (Role = Owner) in one call, saved
+    atomically via a single IUnitOfWork.SaveChangesAsync (both repositories share
+    the one scoped DbContext). Global email uniqueness is checked via
+    IStaffRepository.GetByEmailAsync before insert (409 Conflict on collision) —
+    matches how login resolution looks up Staff by email with no ClinicId scope.
+    Gotcha hit: Staff.Create(...) inside CreateClinicCommandHandler (namespace
+    Features.Clinics.Commands.CreateClinic) resolved to the Features.Staff
+    *namespace* instead of the Staff *entity*, because C# checks enclosing
+    namespaces (here, the shared "Features" ancestor) for a nested "Staff" member
+    before using-directive imports. Same root cause as the shadowing already noted
+    in CLAUDE.md for code written inside Features.Staff itself — turns out it
+    reaches any namespace nested under Features. Fixed with the fully-qualified
+    global::ClinicFlow.Domain.Entities.Staff.Create(...).
+    Not done: the X-Dev-Owner-Email/SystemOwnerEmails bypass is dev/placeholder
+    config, same as DevClinicId — revisit together before shipping to production.
+
+[✅ ADDED 2026-07-08] POST /api/clinics/{id}/staff — cross-tenant staff creation
+    Closes the gap the SystemOwner entry above left open: StaffController's
+    POST /api/staff always creates the staff row for the CALLER's own clinic
+    (via ICurrentClinicService.ClinicId) — a SystemOwner has no ClinicId, so it
+    could never use that endpoint. Added CreateStaffForClinicCommand (+Validator
+    +Handler) under Features/Staff/Commands/CreateStaffForClinic/, and a new
+    ClinicsController action: POST /api/clinics/{id}/staff, SystemOwner-gated via
+    the controller's class-level [Authorize]. The route's {id} overwrites the
+    body's ClinicId (`command with { ClinicId = id }`), same convention as
+    UpdateClinicByIdCommand. Handler validates the clinic exists (404
+    NotFoundException via IClinicRepository.GetByIdAsync) and the email is
+    globally unique (409 ConflictException via IStaffRepository.GetByEmailAsync)
+    before calling Staff.Create — same pattern as CreateClinicCommandHandler's
+    owner-bootstrap logic above. Same Features.Staff namespace-shadowing gotcha
+    applies here (this handler lives INSIDE Features.Staff), fixed the same way
+    with global::ClinicFlow.Domain.Entities.Staff.Create(...).
+    Response: returns 201 with { id } but no Location header/CreatedAtAction —
+    there's no cross-tenant "get staff by id" endpoint to point at yet (the
+    existing StaffController.GetStaffById is tenant-scoped via
+    ICurrentClinicService, which throws for a SystemOwner caller with no
+    ClinicId — pointing there would be wrong, not just unbuilt).
+    Verified via the frontend's Vite proxy: create (201), duplicate email (409),
+    unknown clinic id (404), missing/wrong owner header (401).
+
+[✅ FIXED 2026-07-07] DEACTIVATE/ACTIVATE endpoints — no already-in-state conflict check
+    Endpoints: PATCH /api/staff/{id}/deactivate, PATCH /api/treatments/{id}/deactivate,
+    PATCH /api/clinics/{id}/deactivate, PATCH /api/clinics/{id}/activate
+    Root cause: none of the four handlers checked IsActive before calling
+    Deactivate()/Activate(), so repeat calls silently returned 204 No Content
+    instead of 409 Conflict. Correction to this doc's prior claim: Treatment's
+    deactivate handler did NOT already enforce this — it had the identical bug,
+    verified by testing before the fix (deactivating "Body Piercing" twice both
+    returned 204; test data was restored via direct SQL UPDATE afterward since
+    there's no activate endpoint for treatments).
+    Fix: added `if (!entity.IsActive) throw new ConflictException(...)` (or the
+    inverse for activate) to DeactivateStaffCommandHandler,
+    DeactivateTreatmentCommandHandler, DeactivateClinicCommandHandler, and
+    ActivateClinicCommandHandler. Verified via Staff (409 on repeat deactivate)
+    and Clinic (409 on repeat deactivate AND repeat activate, tested against the
+    orphaned "Sunrise Wellness Clinic" test row, not the dev tenant clinic).
+
+[✅ FIXED 2026-07-07] Invalid enum values bypass FluentValidation with a raw error
+    Example: POST /api/staff with "role": "SuperAdmin".
+    Root cause: System.Text.Json fails to deserialize the invalid enum string
+    during model binding, before the request reaches MediatR/ValidationBehavior.
+    [ApiController]'s automatic 400 short-circuit then returned the default
+    application/problem+json shape instead of the app's application/json
+    {title, status, errors} shape from ExceptionHandlingMiddleware.
+    Fix: Program.cs now configures ApiBehaviorOptions.InvalidModelStateResponseFactory
+    to build the same {title: "Validation failed.", status: 400, errors} JsonResult,
+    content-type application/json, from the ModelState errors. Applies to every
+    controller — any enum property (Role, Gender, AppointmentStatus, etc.) now
+    gets a consistent shape on bad input. Note: the error message text itself is
+    still the raw deserialization message (e.g. "The JSON value could not be
+    converted...") — only the response envelope/content-type was unified, not
+    the message wording.
+
+[✅ FIXED 2026-07-07] Response-shape documentation drift (this file vs. actual DTOs)
+    - CustomerSummaryDto (GET /api/customers list) has NO Gender property; this
+      doc previously showed "gender" in the list response. Corrected above to
+      Id/Name/Phone/Email only — use GET /api/customers/{id} for gender.
+    - CustomerDto (GET /api/customers/{id}) also returns "updatedAt", not just
+      "createdAt" — was undocumented, now added above.
+    - Also added a note on POST /api/customers confirming its Location header
+      was never affected by the POST /api/clinics bug (CustomersController
+      already used the real route id via GetCustomerById).
+    This was a docs-only fix — no code changed. General note: as new
+    fields/endpoints get added, verify this file's example JSON against the
+    actual DTO records rather than trusting prior copies.
+
+[✅ VERIFIED 2026-07-07] Appointment edit — already fully implemented, no changes needed
+    Requested: "add the edit functionality for an existing appointment."
+    Turned out PUT /api/appointments/{id} (UpdateAppointmentCommand/Handler/Validator,
+    documented in the API REFERENCE section above) already covers this, including
+    the 2026-06-30 concurrency fix for treatment-list swaps.
+    Verified end-to-end (not just read from code): created a test appointment,
+    edited date/time/notes and swapped its treatment list 1→2 treatments — no
+    concurrency exception. Confirmed error paths: empty treatments list → 400,
+    editing a Cancelled appointment → 409 ("Only scheduled appointments can be
+    updated."), unknown id → 404. Test appointment removed afterward.
+    Scope decision: UpdateAppointmentCommand has no CustomerId field, so an
+    appointment's customer cannot be reassigned after creation — confirmed with
+    the user that editing date/time/notes/treatments is sufficient for now;
+    customer reassignment is not planned.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  IMPORTANT TECHNICAL NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. EF CORE COLLECTION UPDATES
+   When updating an entity with a collection navigation property (like
+   Appointment.Treatments), NEVER call context.Update(entity). This traverses
+   the full entity graph and marks child entities as Modified. For new children
+   (non-default Guid keys), EF will try to UPDATE non-existent rows → concurrency
+   exception. Instead, use explicit RemoveRange + AddRange on the DbSet.
+
+2. NAMESPACE SHADOWING — Staff entity
+   The namespace ClinicFlow.Application.Features.Staff shadows the entity class
+   Staff in CreateStaffCommandHandler. Fix: use the global:: prefix:
+     global::ClinicFlow.Domain.Entities.Staff.Create(...)
+
+3. SCOPED SERVICES IN MIDDLEWARE
+   TenantMiddleware receives IStaffRepository via InvokeAsync parameter injection
+   (NOT constructor). Constructor injection in middleware creates a singleton-scoped
+   instance that breaks with scoped services.
+
+4. STAFF REPOSITORY — GetByEmailAsync
+   IStaffRepository.GetByEmailAsync has NO clinicId parameter. This is intentional:
+   the middleware does a global lookup by email to identify which clinic the user
+   belongs to. The per-clinic EmailExistsAsync method still has clinicId.
+
+5. HTTPS IN DEVELOPMENT
+   UseHttpsRedirection is skipped in Development (wrapped in if check in Program.cs).
+   The API runs on http://localhost:5062 in dev. Do not use https:// when testing.
+
+6. DOTNET RUN vs DOTNET EXEC
+   When rebuilding after code changes: stop the running process first (the DLL gets
+   locked). Use: Stop-Process -Name "dotnet" -Force
+   Then rebuild: dotnet build ClinicFlow.slnx
+   Then start: dotnet run --project ClinicFlow.csproj --urls "http://localhost:5062" --no-build
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  KEY TEST DATA (LocalDB)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Dev Clinic ID (in appsettings.Development.json):
+  873fb706-2603-4c16-83de-69b6c1999326
+
+Known Customer ID (Sara Ahmed):
+  9b8dbddf-a019-424e-aaa1-702330e1cca9
+
+Known Treatment ID (Laser Treatment):
+  623c8518-f9d7-4705-bce0-918c16f65511
+
+Use these when testing appointment endpoints manually.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  AZURE AD SETUP & ROLE-BASED AUTH — NEXT SESSION STARTING POINT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CURRENT STATE (as of 2026-07-08)
+  - TenantMiddleware looks up the staff member by email from the JWT
+    "preferred_username" claim and sets ClinicId in HttpContext.Items.
+    It does NOT inject the staff's Role (Owner/Receptionist) into the
+    ClaimsPrincipal — that's still CHANGE 1 below, not yet done.
+  - In Development it bypasses JWT entirely using DevClinicId from config.
+  - ClinicsController now has [Authorize(Roles = "SystemOwner")] (see the
+    2026-07-08 "SystemOwner role + clinic-creation bootstrap" entry under
+    KNOWN ISSUES & FIXES) — that's a separate, cross-tenant identity, not the
+    StaffRole system this section is about. Every other controller is still
+    wide open — CHANGE 3's matrix below is entirely unstarted.
+  - appsettings.json has placeholder TenantId and ClientId values.
+
+────────────────────────────────────────────────────────────────────────────────
+  PHASE 1 — Azure Portal (one-time setup, do this first)
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 1 — Register the app in Entra ID (Azure AD)
+  1. Go to portal.azure.com → Microsoft Entra ID → App registrations → New registration
+  2. Fill in:
+       Name                   : ClinicFlow (or any descriptive name)
+       Supported account types: Accounts in this organizational directory only
+                                (single-tenant — recommended for a clinic SaaS)
+       Redirect URI           : leave blank (API only, no browser login needed)
+  3. Click Register
+
+STEP 2 — Collect the values you will need
+  From the app's Overview page, copy:
+    Application (client) ID  → this is your ClientId
+    Directory (tenant) ID    → this is your TenantId
+  Keep these handy for the next step.
+
+STEP 3 — Expose an API scope
+  1. Go to Expose an API → Add a scope
+  2. Accept the suggested App ID URI: api://<ClientId>
+  3. Scope name   : access_as_user
+  4. Who can consent: Admins and users
+  5. Click Add scope
+  Note: The scope name "access_as_user" already matches what is in appsettings.json.
+
+STEP 4 — Create at least one test user
+  Go to Microsoft Entra ID → Users → New user.
+  The UPN/email you set here must exactly match the Email column on a Staff row
+  in the database. That email is the bridge between the Azure AD identity and
+  your clinic's role system.
+
+────────────────────────────────────────────────────────────────────────────────
+  PHASE 2 — Local setup (before touching code)
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 5 — Populate appsettings.json with real values
+  Replace the placeholders with the values copied in Step 2:
+
+    "AzureAd": {
+      "Instance": "https://login.microsoftonline.com/",
+      "Domain": "yourtenant.onmicrosoft.com",
+      "TenantId": "<Directory (tenant) ID>",
+      "ClientId": "<Application (client) ID>",
+      "Scopes": "access_as_user",
+      "CallbackPath": "/signin-oidc"
+    }
+
+  Do NOT commit real values to git. Use User Secrets instead:
+    dotnet user-secrets set "AzureAd:TenantId" "<your-tenant-id>"
+    dotnet user-secrets set "AzureAd:ClientId" "<your-client-id>"
+
+STEP 6 — Ensure the Staff table has a matching record
+  The TenantMiddleware calls staffRepository.GetByEmailAsync(email) where
+  email comes from the "preferred_username" claim in the Azure AD token.
+  Before testing, make sure the database has at least one Staff row where:
+    Email    = the Azure AD user's UPN (e.g. aya@yourtenant.onmicrosoft.com)
+    Role     = 0  (Owner)
+    IsActive = 1  (true)
+  ClinicId must also reference a valid row in the Clinics table.
+
+STEP 7 — Get a test token via Postman
+  1. New Request → Authorization tab → Type: OAuth 2.0
+  2. Grant type : Authorization Code
+                  (or Device Authorization if no browser redirect is configured)
+  3. Auth URL   : https://login.microsoftonline.com/<TenantId>/oauth2/v2.0/authorize
+  4. Token URL  : https://login.microsoftonline.com/<TenantId>/oauth2/v2.0/token
+  5. Scope      : api://<ClientId>/access_as_user
+  6. Client ID  : <ClientId>
+  7. Click Get New Access Token → log in with the test user → copy the token
+  Use the token as a Bearer header on all API calls:
+    Authorization: Bearer <token>
+
+────────────────────────────────────────────────────────────────────────────────
+  PHASE 3 — Code changes (one session, once Phases 1 & 2 are done)
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGE 1 — Inject role claim in TenantMiddleware
+  File: Middleware/TenantMiddleware.cs
+  After the staff lookup succeeds, add the role into the ClaimsPrincipal so
+  ASP.NET Core's built-in [Authorize(Roles = "...")] check works:
+
+    if (staff is not null && staff.IsActive)
+    {
+        context.Items[ClinicIdKey] = staff.ClinicId;
+        var identity = new ClaimsIdentity([new Claim(ClaimTypes.Role, staff.Role.ToString())]);
+        context.User.AddIdentity(identity);
+    }
+
+CHANGE 2 — Expose StaffRole on ICurrentClinicService
+  File: ClinicFlow.Application/Common/Interfaces/ICurrentClinicService.cs
+  Add a Role property to the interface:
+    StaffRole Role { get; }
+  Populate it in CurrentClinicService by reading from HttpContext.Items
+  (set by TenantMiddleware in Change 1 above).
+  This lets handlers make role-aware decisions without touching controllers.
+
+CHANGE 3 — Apply [Authorize] to all controllers
+  Role access matrix:
+
+    Controller              Read                    Write / State change
+    ─────────────────────── ─────────────────────── ────────────────────
+    ClinicsController       Owner                   Owner
+    StaffController         Owner                   Owner
+    TreatmentsController    Owner + Receptionist    Owner
+    CustomersController     Owner + Receptionist    Owner + Receptionist
+    AppointmentsController  Owner + Receptionist    Owner + Receptionist
+    ReportsController       Owner                   —
+
+CHANGE 4 — Remove the DevClinicId bypass
+  File: Middleware/TenantMiddleware.cs
+  Once real auth is working and verified end-to-end, remove the dev bypass
+  block entirely. Do not ship to production with DevClinicId active.
+
+────────────────────────────────────────────────────────────────────────────────
+  READINESS CHECKLIST — complete every item before starting Phase 3
+────────────────────────────────────────────────────────────────────────────────
+
+  Azure Portal
+    [ ] App registered in Entra ID
+    [ ] ClientId and TenantId copied
+    [ ] API scope "access_as_user" created
+    [ ] Test user created in Azure AD
+
+  Local setup
+    [ ] appsettings.json (or User Secrets) populated with real TenantId + ClientId
+    [ ] Staff DB row exists with matching email, Role = Owner, IsActive = true
+    [ ] Postman (or similar) configured to fetch a real Bearer token
+
+  Verification gate — all three must pass before writing any role code
+    [ ] Token successfully returned from Azure AD
+    [ ] Token decoded at jwt.ms shows "preferred_username" matching Staff.Email
+    [ ] API returns 401 when called without a token (authentication is working)
+
+================================================================================
