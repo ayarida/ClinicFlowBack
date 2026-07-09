@@ -1,6 +1,6 @@
 ================================================================================
   CLINICFLOW — IMPLEMENTATION PROGRESS & API REFERENCE
-  Last updated: 2026-07-08
+  Last updated: 2026-07-09
 ================================================================================
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -841,6 +841,33 @@ Remaining (not yet implemented):
     ClinicId — pointing there would be wrong, not just unbuilt).
     Verified via the frontend's Vite proxy: create (201), duplicate email (409),
     unknown clinic id (404), missing/wrong owner header (401).
+
+[✅ ADDED 2026-07-09] X-Dev-Staff-Email — impersonate any staff member in dev
+    Problem: DevClinicId always resolves ClinicId to one fixed dev tenant
+    ("Demo Clinics"), regardless of who's calling. That's fine for testing a
+    single clinic, but there was no way to act as a DIFFERENT clinic's Owner
+    (e.g. to verify a newly system-owner-registered clinic's own Owner can log
+    in and manage their own staff) — every dev request landed on the same
+    tenant no matter what.
+    Fix: TenantMiddleware now falls back to an "X-Dev-Staff-Email" header
+    (Development only, no JWT present) BEFORE the existing email-present
+    branch, so it feeds into the exact same resolution logic a real JWT
+    preferred_username claim would — StaffRepository.GetByEmailAsync(email)
+    → ClinicId, same SystemOwnerEmails check too. No parallel bypass logic to
+    keep in sync; this only adds a second source for "email", not new
+    behavior once resolved. The existing DevClinicId/X-Dev-Owner-Email
+    fallback (else branch) is unchanged and still applies when neither a JWT
+    nor this header is present.
+    Distinct from X-Dev-Owner-Email: that grants the cross-tenant SystemOwner
+    role (no Staff row involved at all); this impersonates an existing Staff
+    row (Owner or Receptionist) at a specific clinic — different personas,
+    not meant to be combined in one request.
+    Verified: as jordan.rivera@riverside.example.com (Owner, Riverside Family
+    Clinic, created via the SystemOwner flow above), GET /clinics/me
+    correctly returns Riverside (not the Demo Clinics fallback), and
+    POST /api/staff creates a Receptionist under Riverside's ClinicId —
+    confirmed absent from Demo Clinics' own staff list, so tenant isolation
+    holds under impersonation too.
 
 [✅ FIXED 2026-07-07] DEACTIVATE/ACTIVATE endpoints — no already-in-state conflict check
     Endpoints: PATCH /api/staff/{id}/deactivate, PATCH /api/treatments/{id}/deactivate,

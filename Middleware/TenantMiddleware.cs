@@ -13,6 +13,15 @@ public class TenantMiddleware(RequestDelegate next, IConfiguration configuration
         var email = context.User.FindFirstValue("preferred_username")
             ?? context.User.FindFirstValue(ClaimTypes.Email);
 
+        if (string.IsNullOrEmpty(email) && env.IsDevelopment())
+        {
+            // Dev-only stand-in for the JWT preferred_username claim: impersonate any
+            // staff member by email, without needing Azure AD configured. Feeds into
+            // the exact same resolution path a real JWT claim would below — no
+            // separate bypass logic, so this can't drift from production behavior.
+            email = context.Request.Headers["X-Dev-Staff-Email"].FirstOrDefault();
+        }
+
         if (!string.IsNullOrEmpty(email))
         {
             if (IsSystemOwnerEmail(email))
